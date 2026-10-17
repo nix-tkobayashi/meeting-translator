@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pyinstaller==6.11.1
+        run: python -m pip install -r requirements.txt pyinstaller pyinstaller-hooks-contrib
 
       - name: Test
         run: python -m unittest discover -s tests -v
@@ -34,6 +34,15 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --windowed --onedir --name MeetingTranslator
           --collect-data soundcard --collect-submodules amazon_transcribe app.py
+
+      - name: Smoke test EXE
+        shell: pwsh
+        run: |
+          # Windowed builds show a dialog on import errors instead of exiting, so enforce a timeout.
+          $env:MEETING_TRANSLATOR_SMOKE_TEST = '1'
+          $p = Start-Process dist/MeetingTranslator/MeetingTranslator.exe -PassThru
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; throw 'EXE did not exit (startup error dialog?)' }
+          if ($p.ExitCode -ne 0) { throw "EXE exited with $($p.ExitCode)" }
 
       - name: Build ZIP
         shell: pwsh

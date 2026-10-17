@@ -457,6 +457,10 @@ class TranslatorUI:
 
 
 if __name__ == '__main__':
+    if os.getenv('MEETING_TRANSLATOR_SMOKE_TEST'):
+        # Packaging check: load lazily imported modules too, then exit without opening the UI.
+        import amazon_transcribe.auth, amazon_transcribe.client, amazon_transcribe.handlers, amazon_transcribe.model  # noqa: F401
+        raise SystemExit(0)
     app = tk.Tk()
     TranslatorUI(app)
     app.mainloop()
