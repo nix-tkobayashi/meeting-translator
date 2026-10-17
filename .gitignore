@@ -1,0 +1,10 @@
+config.json
+.env
+*.spec
+build/
+dist/
+__pycache__/
+*.pyc
+*.log
+*.jsonl
+meeting-captions-*.json

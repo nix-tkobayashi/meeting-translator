@@ -1,0 +1,5 @@
+openai>=1.70,<3
+soundcard>=0.4.4,<0.5
+numpy>=1.26,<3
+boto3>=1.35,<2
+amazon-transcribe>=0.6.2,<1

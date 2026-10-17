@@ -1,0 +1,94 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Meeting Translator: browser-login Cognito identity for AWS Transcribe and Bedrock (POC)'
+Parameters:
+  DomainPrefix:
+    Type: String
+    Description: 'Globally unique Cognito managed-login domain prefix'
+    AllowedPattern: '[a-z0-9-]+'
+  BedrockModelResourceArn:
+    Type: String
+    Default: '*'
+    Description: 'POC default *; restrict to required inference profile and foundation model ARNs in production'
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: meeting-translator-users
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: meeting-translator-desktop
+      GenerateSecret: false
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      CallbackURLs: ['http://localhost:8765/callback']
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix
+      UserPoolId: !Ref UserPool
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: meeting_translator
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref AppClient
+          ProviderName: !GetAtt UserPool.ProviderName
+          ServerSideTokenCheck: true
+  AuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: cognito-identity.amazonaws.com}
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals: {'cognito-identity.amazonaws.com:aud': !Ref IdentityPool}
+              'ForAnyValue:StringLike': {'cognito-identity.amazonaws.com:amr': authenticated}
+      Policies:
+        - PolicyName: TranslateAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [transcribe:StartStreamTranscription]
+                Resource: '*'
+              - Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource: !Ref BedrockModelResourceArn
+  RoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthRole.Arn
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Value: !Ref AppClient
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+  LoginDomain:
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
