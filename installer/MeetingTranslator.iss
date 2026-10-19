@@ -40,3 +40,5 @@ Name: "{autodesktop}\Meeting Translator"; Filename: "{app}\MeetingTranslator.exe
 
 [Run]
 Filename: "{app}\MeetingTranslator.exe"; Description: "{cm:LaunchProgram,Meeting Translator}"; Flags: nowait postinstall skipifsilent
+; In-app updates run this installer with /SILENT; relaunch the app afterwards.
+Filename: "{app}\MeetingTranslator.exe"; Flags: nowait skipifnotsilent

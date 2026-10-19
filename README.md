@@ -49,6 +49,10 @@ aws cognito-idp admin-create-user --user-pool-id YOUR_USER_POOL_ID `
 5. スピーカーとマイクを指定。音声認識は「Amazon Transcribe Streaming」を選ぶ
 6. 「双方向モード（双方のPCで実行）」を選び、両者がそれぞれ自分のPCで翻訳開始。相手の発言が自分の画面で翻訳されます。
 
+### アップデート
+
+起動時にGitHub Releasesの最新版を確認し、新しいバージョンがあれば「⬆ vX.Y.Z に更新」ボタンを表示します。押すとセットアップEXEをダウンロードし、GitHubが公開するSHA-256と照合したうえでサイレントインストールし、アプリを再起動します（翻訳中は停止してから実行）。v0.1.0は更新機能を持たないため、v0.2.0のみ手動でインストールしてください。
+
 **重要:** 双方向モードは字幕表示の使い方を示すモードです。PC間のピア接続や字幕転送は行いません。双方がZoom等の会議で声を聞けることが前提です。
 
 ### ソースコードをWindowsで起動
@@ -67,7 +71,17 @@ py -3.12 -m venv .venv
 
 - GitHub Actions → `Windows release` → `Run workflow` でセットアップEXEとZIPをActions Artifactsへ生成
 - `v0.1.0`などのGitタグをpushするとGitHub Releaseに`MeetingTranslator-Setup-<version>.exe`（Inno Setup製）と`MeetingTranslator-Windows.zip`を添付
-- Python実行環境不要の`--onedir`配布。**未署名のためWindows SmartScreen等の警告が出る場合があります**。公開配布前にはコード署名と実機動作検証を推奨します
+- Python実行環境不要の`--onedir`配布
+
+### コード署名（SmartScreen警告対策）
+
+署名なしのEXEは「WindowsによってPCが保護されました」と表示されます。ワークフローは[Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/)でアプリ本体とセットアップEXEに署名します。以下のリポジトリ変数（Settings → Secrets and variables → Actions → Variables）が未設定の間は署名をスキップします。
+
+1. Azureで Artifact Signing アカウントを作成し、本人確認（Identity validation）を完了して Public Trust の証明書プロファイルを作成
+2. GitHub Actions用のEntra IDアプリ登録を作成し、フェデレーション資格情報（`repo:nix-tkobayashi/meeting-translator:ref:refs/tags/*` など）を追加。署名アカウントで証明書プロファイルの署名者ロール（Certificate Profile Signer）を付与
+3. リポジトリ変数を設定: `AZURE_CLIENT_ID` `AZURE_TENANT_ID` `AZURE_SUBSCRIPTION_ID` `SIGNING_ENDPOINT`（例 `https://jpe.codesigning.azure.net/`）`SIGNING_ACCOUNT_NAME` `SIGNING_CERTIFICATE_PROFILE`
+
+署名後もSmartScreenの評価はダウンロード実績で蓄積されるため、署名直後のリリースでは警告が残る場合があります。
 
 ```powershell
 git add .

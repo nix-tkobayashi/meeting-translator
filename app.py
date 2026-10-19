@@ -11,6 +11,8 @@ import time
 import wave
 from datetime import datetime
 from auth import load_public_config, browser_login
+import updater
+from version import __version__
 from pathlib import Path
 
 import numpy as np
@@ -54,7 +56,7 @@ def make_aws_session(region, credentials):
 class TranslatorUI:
     def __init__(self, root):
         self.root = root
-        self.root.title('Meeting Translator — Botなし双方向字幕')
+        self.root.title(f'Meeting Translator {__version__} — Botなし双方向字幕')
         self.root.geometry('1000x820')
         self.root.minsize(700, 480)
         self.root.configure(bg='#101622')
@@ -77,6 +79,8 @@ class TranslatorUI:
         self.refresh_devices()
         self.root.after(100, self.process_events)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.pending_update = None
+        threading.Thread(target=self.check_update, daemon=True).start()
 
     def make_ui(self):
         s = ttk.Style()
@@ -131,6 +135,9 @@ class TranslatorUI:
                   padx=12, pady=8).pack(side='left', padx=8)
         tk.Button(buttons, text='デバイス更新', command=self.refresh_devices, padx=12, pady=8).pack(side='left', padx=8)
         tk.Button(buttons, text='字幕保存', command=self.save_history, padx=12, pady=8).pack(side='right')
+        # Shown only when a newer release exists.
+        self.update_button = tk.Button(buttons, text='', command=self.install_update, bg='#2e9d6a', fg='white',
+                                       activebackground='#227a52', relief='flat', padx=12, pady=8)
         self.status = tk.StringVar(value='開始前 | AWS認証情報を入力するか既存のAWSプロファイルを使用')
         self.partial = tk.StringVar(value='')
         tk.Label(self.root, textvariable=self.status, bg='#101622', fg='#9fb2ce', anchor='w', font=('Segoe UI', 10)).pack(fill='x', padx=24)
@@ -151,6 +158,31 @@ class TranslatorUI:
         self.output.tag_config('error', foreground='#ffb4b4')
         self.output.tag_config('plain', foreground='#f2f6fc')
         self.add_line('システム', 'スピーカーとマイクを選んで「翻訳開始」を押してください。', '', 'info')
+
+    def check_update(self):
+        try:
+            update = updater.check_for_update(__version__)
+        except Exception:
+            return  # offline or API limit: updates are optional
+        if update:
+            self.events.put(('update_available', update))
+
+    def install_update(self):
+        if self.active:
+            messagebox.showwarning('翻訳中', '先に翻訳を停止してください。')
+            return
+        update = self.pending_update
+        if not update or not messagebox.askyesno('アップデート', f'バージョン {update["version"]} をインストールします。\nアプリは一度終了し、更新後に再起動します。'):
+            return
+        self.update_button.config(state='disabled')
+        self.status.set(f'バージョン {update["version"]} をダウンロード中…')
+
+        def task():
+            try:
+                self.events.put(('update_ready', updater.download(update)))
+            except Exception as exc:
+                self.events.put(('update_error', str(exc)))
+        threading.Thread(target=task, daemon=True).start()
 
     def begin_login(self):
         if self.active:
@@ -433,6 +465,24 @@ class TranslatorUI:
                 elif event[0] == 'login_error':
                     self.status.set('ブラウザ認証失敗: ' + event[1])
                     messagebox.showerror('ログイン失敗', event[1])
+                elif event[0] == 'update_available':
+                    self.pending_update = event[1]
+                    self.update_button.config(text=f'⬆ v{event[1]["version"]} に更新')
+                    self.update_button.pack(side='right', padx=8)
+                    self.status.set(f'新しいバージョン {event[1]["version"]} があります（現在 {__version__}）')
+                elif event[0] == 'update_ready':
+                    try:
+                        updater.launch_installer(event[1], os.getpid())
+                    except Exception as exc:
+                        self.update_button.config(state='normal')
+                        messagebox.showerror('アップデート失敗', str(exc))
+                    else:
+                        self.close()
+                        os._exit(0)  # don't wait for in-flight translation threads; Setup waits for this PID
+                elif event[0] == 'update_error':
+                    self.update_button.config(state='normal')
+                    self.status.set('アップデート失敗: ' + event[1])
+                    messagebox.showerror('アップデート失敗', event[1])
                 elif event[0] == 'error':
                     _, source, error = event
                     self.add_line('エラー: ' + source, error, '', 'error')
