@@ -1,6 +1,7 @@
 import queue
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -36,7 +37,8 @@ import app  # noqa: E402
 def make_ui():
     ui = app.TranslatorUI.__new__(app.TranslatorUI)
     ui.events = queue.Queue()
-    ui.translation_pool = app.concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    ui.translation_pools = {'相手': app.concurrent.futures.ThreadPoolExecutor(max_workers=1)}
+    ui.pools_lock = threading.Lock()
     ui.bedrock = mock.Mock()
     return ui
 
@@ -65,13 +67,14 @@ class MakeAwsSessionTest(unittest.TestCase):
 
 class TranslationStopTest(unittest.TestCase):
     def tearDown(self):
-        self.ui.translation_pool.shutdown(wait=True, cancel_futures=True)
+        for pool in self.ui.translation_pools.values():
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def test_schedule_skips_stopped_session(self):
         self.ui = make_ui()
         stop = threading.Event()
         stop.set()
-        with mock.patch.object(self.ui.translation_pool, 'submit') as submit:
+        with mock.patch.object(self.ui.translation_pools['相手'], 'submit') as submit:
             self.ui.schedule_translation('相手', 'hello', stop)
         submit.assert_not_called()
 
@@ -97,32 +100,55 @@ class TranslationStopTest(unittest.TestCase):
         old_client = self.ui.bedrock
         old_client.converse.return_value = bedrock_reply('en\nこんにちは')
         gate = threading.Event()
-        self.ui.translation_pool.submit(gate.wait)
+        self.ui.translation_pools['相手'].submit(gate.wait)
         self.ui.schedule_translation('相手', 'hello', threading.Event())
         self.ui.bedrock = mock.Mock()  # a new session replaces the client
         gate.set()
-        self.ui.translation_pool.shutdown(wait=True)
+        self.ui.translation_pools['相手'].shutdown(wait=True)
         old_client.converse.assert_called_once()
         self.ui.bedrock.converse.assert_not_called()
 
     def test_cancel_drops_queued_translations(self):
         self.ui = make_ui()
         gate = threading.Event()
-        old_pool = self.ui.translation_pool
+        old_pool = self.ui.translation_pools['相手']
         old_pool.submit(gate.wait)  # occupy the only worker
         self.ui.schedule_translation('相手', 'hello', threading.Event())
         self.ui.cancel_translations()
         gate.set()
         old_pool.shutdown(wait=True)
         self.ui.bedrock.converse.assert_not_called()
-        self.assertIsNot(self.ui.translation_pool, old_pool)
+        self.assertEqual(self.ui.translation_pools, {})
         self.assertTrue(self.ui.events.empty())
 
-    def test_schedule_after_pool_shutdown_is_ignored(self):
+    def test_schedule_after_cancel_starts_fresh_pool(self):
         self.ui = make_ui()
-        self.ui.translation_pool.shutdown(wait=True)
+        self.ui.bedrock.converse.return_value = bedrock_reply('en\nこんにちは')
+        self.ui.cancel_translations()
         self.ui.schedule_translation('相手', 'hello', threading.Event())
-        self.ui.translation_pool = app.concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.ui.translation_pools['相手'].shutdown(wait=True)
+        self.ui.bedrock.converse.assert_called_once()
+
+    def test_captions_keep_order_per_speaker(self):
+        self.ui = make_ui()
+        self.ui.translation_pools = {}
+        delays = {'first.': 0.2, 'second.': 0.0}
+
+        def converse(messages, **_):
+            text = messages[0]['content'][0]['text']
+            time.sleep(delays.get(text, 0))
+            return bedrock_reply('en\n' + text.upper())
+
+        self.ui.bedrock.converse.side_effect = converse
+        stop = threading.Event()
+        for text in ('first.', 'second.'):
+            self.ui.schedule_translation('相手', text, stop)
+        self.ui.schedule_translation('自分', 'mine.', stop)
+        self.assertEqual(set(self.ui.translation_pools), {'相手', '自分'})
+        for pool in self.ui.translation_pools.values():
+            pool.shutdown(wait=True)
+        captions = [e[2] for e in list(self.ui.events.queue) if e[1] == '相手']
+        self.assertEqual(captions, ['first.', 'second.'])
 
     def test_error_suppressed_after_stop(self):
         self.ui = make_ui()
@@ -190,7 +216,7 @@ class UiTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.ui = app.TranslatorUI(self.root)
-        self.addCleanup(self.ui.translation_pool.shutdown, wait=False)
+        self.addCleanup(self.ui.cancel_translations)
         self.root.update()
 
     def test_settings_toggle(self):

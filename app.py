@@ -12,6 +12,7 @@ import wave
 from datetime import datetime
 from auth import load_public_config, browser_login
 import updater
+from segmenter import SentenceSegmenter
 from version import __version__
 from pathlib import Path
 
@@ -89,7 +90,8 @@ class TranslatorUI:
         self.speakers = []
         self.mics = []
         self.api_client = None
-        self.translation_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.translation_pools = {}  # kind -> single-worker executor, keeps each speaker's captions in order
+        self.pools_lock = threading.Lock()
         self.aws_session = None
         self.bedrock = None
         self.runtime_region = None
@@ -369,6 +371,7 @@ class TranslatorUI:
             partial_results_stability='medium',
         )
         ui = self
+        segmenter = SentenceSegmenter()
 
         class CaptionHandler(TranscriptResultStreamHandler):
             async def handle_transcript_event(self, event: TranscriptEvent):
@@ -378,11 +381,12 @@ class TranslatorUI:
                     original = (result.alternatives[0].transcript or '').strip()
                     if not original or stop_event.is_set():
                         continue
-                    if result.is_partial:
-                        ui.events.put(('partial', kind, original))
-                    else:
-                        ui.events.put(('partial', kind, ''))
-                        ui.schedule_translation(kind, original, stop_event)
+                    ui.events.put(('partial', kind, original if result.is_partial else ''))
+                    items = [(item.content or '', item.item_type, bool(item.stable))
+                             for item in (result.alternatives[0].items or [])]
+                    # Stable sentences are translated during long speech without waiting for a pause.
+                    for sentence in segmenter.feed(result.result_id, items, result.is_partial, original):
+                        ui.schedule_translation(kind, sentence, stop_event)
 
         async def send_audio():
             try:
@@ -412,15 +416,18 @@ class TranslatorUI:
         # stop_event belongs to the session that produced the text, so a stopped session never sends to Bedrock.
         if stop_event.is_set():
             return
-        try:
-            self.translation_pool.submit(self.translate_with_bedrock, kind, original, stop_event, self.bedrock)
-        except RuntimeError:
-            pass  # pool was shut down by stop/close
+        with self.pools_lock:  # called from capture threads while stop/close may swap the pools
+            pool = self.translation_pools.get(kind)
+            if pool is None:
+                pool = self.translation_pools[kind] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            pool.submit(self.translate_with_bedrock, kind, original, stop_event, self.bedrock)
 
     def cancel_translations(self):
         # Drop queued requests; requests already sent to Bedrock finish but are not displayed.
-        self.translation_pool.shutdown(wait=False, cancel_futures=True)
-        self.translation_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        with self.pools_lock:
+            pools, self.translation_pools = self.translation_pools, {}
+        for pool in pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def translate_with_bedrock(self, kind, original, stop_event, bedrock):
         if stop_event.is_set():
@@ -558,7 +565,7 @@ class TranslatorUI:
 
     def close(self):
         self.stop.set()
-        self.translation_pool.shutdown(wait=False, cancel_futures=True)
+        self.cancel_translations()
         self.root.destroy()
 
 
