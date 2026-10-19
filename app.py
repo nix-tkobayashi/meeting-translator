@@ -20,12 +20,17 @@ import soundcard as sc
 from openai import OpenAI
 import boto3
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 
 RATE = 24000
 CHUNK_SECONDS = 5
 STREAM_FRAMES = 1600  # 100ms at 16 kHz
 SILENCE_RMS = 0.0025
+# Japanese UI fonts bundled with Windows; Tk may report either the English or the Japanese family name.
+JA_FONTS = ('Yu Gothic UI', '游ゴシック UI', 'Meiryo UI', 'メイリオ UI', 'Meiryo', 'メイリオ', 'MS UI Gothic')
+AWS_ENV_LINE = re.compile(
+    r'''^\s*(?:export\s+|set\s+|\$env:)?["']?(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\s*=\s*(.*?)\s*;?\s*$''',
+    re.IGNORECASE)
 
 
 def to_wav(audio):
@@ -42,6 +47,23 @@ def to_wav(audio):
     buf.seek(0)
     buf.name = 'audio.wav'
     return buf
+
+
+def pick_font(families):
+    available = set(families)
+    return next((name for name in JA_FONTS if name in available), 'TkDefaultFont')
+
+
+def parse_aws_env(text):
+    """Extract AWS_* credentials from pasted bash/cmd/PowerShell environment variable lines."""
+    found = {}
+    for line in (text or '').splitlines():
+        match = AWS_ENV_LINE.match(line)
+        if match:
+            value = match.group(2).strip().strip('"\'')
+            if value:
+                found[match.group(1).upper()] = value
+    return found
 
 
 def make_aws_session(region, credentials):
@@ -86,12 +108,31 @@ class TranslatorUI:
         s = ttk.Style()
         s.theme_use('clam')
         s.configure('TCombobox', padding=5)
+        self.font = pick_font(tkfont.families(self.root))
+        if self.font != 'TkDefaultFont':
+            for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont', 'TkCaptionFont'):
+                tkfont.nametofont(name).configure(family=self.font)
         top = tk.Frame(self.root, bg='#101622')
         top.pack(fill='x', padx=22, pady=(20, 6))
-        tk.Label(top, text='Meeting Translator', bg='#101622', fg='#f8fafc', font=('Segoe UI', 22, 'bold')).pack(side='left')
-        tk.Label(top, text='LOCAL CAPTURE · NO MEETING BOT', bg='#101622', fg='#7db3ff', font=('Segoe UI', 9, 'bold')).pack(side='right')
+        tk.Label(top, text='Meeting Translator', bg='#101622', fg='#f8fafc', font=(self.font, 22, 'bold')).pack(side='left')
+        tk.Label(top, text='LOCAL CAPTURE · NO MEETING BOT', bg='#101622', fg='#7db3ff', font=(self.font, 9, 'bold')).pack(side='right')
+        buttons = tk.Frame(self.root, bg='#101622')
+        buttons.pack(fill='x', padx=22, pady=(6, 0))
+        self.start_button = tk.Button(buttons, text='●  翻訳開始', bg='#3485ff', fg='white', activebackground='#236bd2', relief='flat', padx=18, pady=10, command=self.toggle)
+        self.start_button.pack(side='left')
+        self.settings_button = tk.Button(buttons, text='▲ 設定を隠す', command=self.toggle_settings, padx=12, pady=8)
+        self.settings_button.pack(side='left', padx=8)
+        tk.Button(buttons, text='ブラウザでAWSログイン', command=self.begin_login,
+                  padx=12, pady=8).pack(side='left', padx=8)
+        tk.Button(buttons, text='デバイス更新', command=self.refresh_devices, padx=12, pady=8).pack(side='left', padx=8)
+        tk.Button(buttons, text='字幕保存', command=self.save_history, padx=12, pady=8).pack(side='right')
+        # Shown only when a newer release exists.
+        self.update_button = tk.Button(buttons, text='', command=self.install_update, bg='#2e9d6a', fg='white',
+                                       activebackground='#227a52', relief='flat', padx=12, pady=8)
+        self.buttons = buttons
         cfg = tk.Frame(self.root, bg='#1a2435', padx=14, pady=12)
         cfg.pack(fill='x', padx=22, pady=12)
+        self.cfg = cfg
         tk.Label(cfg, text='相手の音声（スピーカー）', bg='#1a2435', fg='white').grid(row=0, column=0, sticky='w')
         tk.Label(cfg, text='自分の音声（マイク）', bg='#1a2435', fg='white').grid(row=0, column=1, sticky='w', padx=(12,0))
         self.speaker_choice = ttk.Combobox(cfg, state='readonly')
@@ -106,7 +147,7 @@ class TranslatorUI:
         self.region = tk.StringVar(value=os.getenv('AWS_REGION', 'ap-northeast-1'))
         ttk.Entry(cfg, textvariable=self.region).grid(row=3, column=1, sticky='ew', padx=(12,0), pady=(4,0))
         # Credentials entered here remain in process memory only; never written to a file.
-        tk.Label(cfg, text='AWS認証情報（3項目を貼り付け / 空欄なら既存のAWSプロファイルを使用）',
+        tk.Label(cfg, text='AWS認証情報（export AWS_...=... の3行をまとめて貼り付けると自動入力 / 空欄なら既存のAWSプロファイルを使用）',
                  bg='#1a2435', fg='#b9cce6').grid(row=4, column=0, columnspan=2, sticky='w', pady=(14, 4))
         self.access_key = tk.StringVar()
         self.secret_key = tk.StringVar()
@@ -121,43 +162,56 @@ class TranslatorUI:
             tk.Label(cfg, text=label, bg='#1a2435', fg='white').grid(row=row_index, column=0, sticky='w', pady=(6, 0))
             entry = ttk.Entry(cfg, textvariable=variable, show='•' if secret else '')
             entry.grid(row=row_index, column=1, sticky='ew', padx=(12, 0), pady=(6, 0))
+            entry.bind('<<Paste>>', self.paste_credentials)
             self.credential_entries.append(entry)
         tk.Label(cfg, text='利用モード', bg='#1a2435', fg='white').grid(row=8, column=0, sticky='w', pady=(9,0))
         ttk.Combobox(cfg, state='readonly', textvariable=self.mode_choice,
                      values=['個人モード', '双方向モード（双方のPCで実行）']).grid(row=9, column=0, columnspan=2, sticky='ew', pady=4)
         cfg.columnconfigure(0, weight=1)
         cfg.columnconfigure(1, weight=1)
-        buttons = tk.Frame(cfg, bg='#1a2435')
-        buttons.grid(row=10, column=0, columnspan=2, sticky='ew', pady=(12,0))
-        self.start_button = tk.Button(buttons, text='●  翻訳開始', bg='#3485ff', fg='white', activebackground='#236bd2', relief='flat', padx=18, pady=10, command=self.toggle)
-        self.start_button.pack(side='left')
-        tk.Button(buttons, text='ブラウザでAWSログイン', command=self.begin_login,
-                  padx=12, pady=8).pack(side='left', padx=8)
-        tk.Button(buttons, text='デバイス更新', command=self.refresh_devices, padx=12, pady=8).pack(side='left', padx=8)
-        tk.Button(buttons, text='字幕保存', command=self.save_history, padx=12, pady=8).pack(side='right')
-        # Shown only when a newer release exists.
-        self.update_button = tk.Button(buttons, text='', command=self.install_update, bg='#2e9d6a', fg='white',
-                                       activebackground='#227a52', relief='flat', padx=12, pady=8)
         self.status = tk.StringVar(value='開始前 | AWS認証情報を入力するか既存のAWSプロファイルを使用')
         self.partial = tk.StringVar(value='')
-        tk.Label(self.root, textvariable=self.status, bg='#101622', fg='#9fb2ce', anchor='w', font=('Segoe UI', 10)).pack(fill='x', padx=24)
-        tk.Label(self.root, textvariable=self.partial, bg='#101622', fg='#e6d79d', anchor='w', wraplength=940, font=('Segoe UI', 10)).pack(fill='x', padx=24, pady=4)
+        tk.Label(self.root, textvariable=self.status, bg='#101622', fg='#9fb2ce', anchor='w', font=(self.font, 10)).pack(fill='x', padx=24)
+        tk.Label(self.root, textvariable=self.partial, bg='#101622', fg='#e6d79d', anchor='w', wraplength=940, font=(self.font, 10)).pack(fill='x', padx=24, pady=4)
         head = tk.Frame(self.root, bg='#101622')
         head.pack(fill='x', padx=22, pady=(14,4))
-        tk.Label(head, text='リアルタイム字幕', bg='#101622', fg='white', font=('Segoe UI', 14, 'bold')).pack(side='left')
+        tk.Label(head, text='リアルタイム字幕', bg='#101622', fg='white', font=(self.font, 14, 'bold')).pack(side='left')
         tk.Label(head, text='原文 + 相手言語への翻訳（日本語 ⇄ 英語）', bg='#101622', fg='#9fb2ce').pack(side='right')
         container = tk.Frame(self.root, bg='#172133')
         container.pack(fill='both', expand=True, padx=22, pady=(4,20))
         scrollbar = tk.Scrollbar(container)
         scrollbar.pack(side='right', fill='y')
-        self.output = tk.Text(container, bg='#172133', fg='#f2f6fc', relief='flat', padx=22, pady=18, wrap='word', font=('Segoe UI', 12), state='disabled', yscrollcommand=scrollbar.set, spacing3=8)
+        self.output = tk.Text(container, bg='#172133', fg='#f2f6fc', relief='flat', padx=22, pady=18, wrap='word', font=(self.font, 12), state='disabled', yscrollcommand=scrollbar.set, spacing3=8)
         self.output.pack(fill='both', expand=True)
         scrollbar.config(command=self.output.yview)
-        self.output.tag_config('meta', foreground='#8fbaff', font=('Segoe UI', 10, 'bold'))
-        self.output.tag_config('translation', foreground='#c3efd9', font=('Segoe UI', 13, 'bold'))
+        self.output.tag_config('meta', foreground='#8fbaff', font=(self.font, 10, 'bold'))
+        self.output.tag_config('translation', foreground='#c3efd9', font=(self.font, 13, 'bold'))
         self.output.tag_config('error', foreground='#ffb4b4')
         self.output.tag_config('plain', foreground='#f2f6fc')
         self.add_line('システム', 'スピーカーとマイクを選んで「翻訳開始」を押してください。', '', 'info')
+
+    def paste_credentials(self, event):
+        try:
+            found = parse_aws_env(self.root.clipboard_get())
+        except tk.TclError:
+            return None
+        if 'AWS_ACCESS_KEY_ID' not in found or 'AWS_SECRET_ACCESS_KEY' not in found:
+            return None  # ordinary single-value paste
+        self.access_key.set(found['AWS_ACCESS_KEY_ID'])
+        self.secret_key.set(found['AWS_SECRET_ACCESS_KEY'])
+        self.session_token.set(found.get('AWS_SESSION_TOKEN', ''))  # clear a stale token when none is pasted
+        self.status.set('AWS認証情報を貼り付けました（' + ', '.join(sorted(found)) + '）')
+        return 'break'
+
+    def set_settings_visible(self, visible):
+        if visible:
+            self.cfg.pack(fill='x', padx=22, pady=12, after=self.buttons)
+        else:
+            self.cfg.pack_forget()
+        self.settings_button.config(text='▲ 設定を隠す' if visible else '▼ 設定を表示')
+
+    def toggle_settings(self):
+        self.set_settings_visible(not self.cfg.winfo_manager())
 
     def check_update(self):
         try:
@@ -231,6 +285,7 @@ class TranslatorUI:
             self.partial.set('')
             for widget in self.credential_entries:
                 widget.config(state='normal')
+            self.set_settings_visible(True)
             return
         if self.speaker_choice.current() < 0 or self.mic_choice.current() < 0:
             messagebox.showerror('デバイス未選択', 'スピーカーとマイクを選択してください。')
@@ -266,6 +321,7 @@ class TranslatorUI:
         for widget in self.credential_entries:
             widget.config(state='disabled')
         self.start_button.config(text='■  停止', bg='#b24c62')
+        self.set_settings_visible(False)  # give the captions the space while translating
         self.status.set(self.mode_choice.get() + ' · 音声取得中 · Bot不使用 · 相手側でもアプリを起動してください' if self.mode_choice.get().startswith('双方向') else '個人モード · 音声取得中 · Bot不使用')
         speaker = self.speakers[self.speaker_choice.current()]
         mic = self.mics[self.mic_choice.current()]

@@ -25,7 +25,7 @@ try:
     import tkinter  # noqa: F401
 except ImportError:
     tk_stub = types.ModuleType('tkinter')
-    for sub in ('ttk', 'messagebox', 'filedialog'):
+    for sub in ('ttk', 'messagebox', 'filedialog', 'font'):
         setattr(tk_stub, sub, types.ModuleType('tkinter.' + sub))
         sys.modules['tkinter.' + sub] = getattr(tk_stub, sub)
     sys.modules['tkinter'] = tk_stub
@@ -136,6 +136,97 @@ class TranslationStopTest(unittest.TestCase):
         client.converse.side_effect = stop_then_fail
         self.ui.translate_with_bedrock('相手', 'hello', stop, client)
         self.assertTrue(self.ui.events.empty())
+
+
+class ParseAwsEnvTest(unittest.TestCase):
+    EXPECTED = {'AWS_ACCESS_KEY_ID': 'AKIAEXAMPLE', 'AWS_SECRET_ACCESS_KEY': 'se/cr+et', 'AWS_SESSION_TOKEN': 'tok=='}
+
+    def test_bash_export(self):
+        text = 'export AWS_ACCESS_KEY_ID="AKIAEXAMPLE"\nexport AWS_SECRET_ACCESS_KEY="se/cr+et"\nexport AWS_SESSION_TOKEN="tok=="\n'
+        self.assertEqual(app.parse_aws_env(text), self.EXPECTED)
+
+    def test_cmd_and_powershell_and_crlf(self):
+        text = 'set AWS_ACCESS_KEY_ID=AKIAEXAMPLE\r\nSET "AWS_SECRET_ACCESS_KEY=se/cr+et"\r\n$Env:AWS_SESSION_TOKEN="tok==";\r\n'
+        self.assertEqual(app.parse_aws_env(text), self.EXPECTED)
+
+    def test_ignores_other_lines_and_empty_values(self):
+        text = "# comment\nexport AWS_REGION=us-east-1\nexport AWS_ACCESS_KEY_ID='AKIAEXAMPLE'\nexport AWS_SESSION_TOKEN=\"\""
+        self.assertEqual(app.parse_aws_env(text), {'AWS_ACCESS_KEY_ID': 'AKIAEXAMPLE'})
+
+    def test_plain_value(self):
+        self.assertEqual(app.parse_aws_env('AKIAEXAMPLE'), {})
+
+
+class PickFontTest(unittest.TestCase):
+    def test_prefers_yu_gothic_ui(self):
+        self.assertEqual(app.pick_font(['Segoe UI', 'Meiryo UI', 'Yu Gothic UI']), 'Yu Gothic UI')
+
+    def test_japanese_family_name(self):
+        self.assertEqual(app.pick_font(['メイリオ UI']), 'メイリオ UI')
+
+    def test_fallback(self):
+        self.assertEqual(app.pick_font(['Segoe UI']), 'TkDefaultFont')
+
+
+def _real_tk():
+    try:
+        root = app.tk.Tk()
+    except Exception:
+        return None
+    return root
+
+
+@unittest.skipUnless(hasattr(app.tk, 'Tk'), 'tkinter not available')
+class UiTest(unittest.TestCase):
+    def setUp(self):
+        self.root = _real_tk()
+        if self.root is None:
+            self.skipTest('no display for Tk')
+        self.addCleanup(self.root.destroy)
+        sc_stub = mock.Mock(all_speakers=mock.Mock(return_value=[]), all_microphones=mock.Mock(return_value=[]))
+        patches = [mock.patch.object(app, 'sc', sc_stub),
+                   mock.patch.object(app.updater, 'check_for_update', return_value=None)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.ui = app.TranslatorUI(self.root)
+        self.addCleanup(self.ui.translation_pool.shutdown, wait=False)
+        self.root.update()
+
+    def test_settings_toggle(self):
+        self.assertTrue(self.ui.cfg.winfo_manager())
+        self.ui.toggle_settings()
+        self.assertFalse(self.ui.cfg.winfo_manager())
+        self.assertIn('表示', self.ui.settings_button.cget('text'))
+        self.ui.toggle_settings()
+        self.root.update()
+        self.assertTrue(self.ui.cfg.winfo_manager())
+        # Settings come back directly below the button bar, above the captions.
+        self.assertLess(self.ui.cfg.winfo_y(), self.ui.output.winfo_rooty() - self.root.winfo_rooty())
+
+    def test_paste_fills_all_fields(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append('export AWS_ACCESS_KEY_ID="AKIAEXAMPLE"\nexport AWS_SECRET_ACCESS_KEY="secret"\n')
+        self.ui.session_token.set('stale')
+        self.ui.credential_entries[0].event_generate('<<Paste>>')
+        self.assertEqual(self.ui.access_key.get(), 'AKIAEXAMPLE')
+        self.assertEqual(self.ui.secret_key.get(), 'secret')
+        self.assertEqual(self.ui.session_token.get(), '')
+
+    def test_single_value_paste_is_normal(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append('AKIAONLY')
+        entry = self.ui.credential_entries[0]
+        entry.focus_force()
+        entry.event_generate('<<Paste>>')
+        self.assertEqual(self.ui.access_key.get(), 'AKIAONLY')
+        self.assertEqual(self.ui.secret_key.get(), '')
+
+    def test_japanese_font_applied(self):
+        if self.ui.font == 'TkDefaultFont':
+            self.skipTest('no Japanese UI font installed')
+        family = app.tkfont.nametofont('TkDefaultFont').cget('family')
+        self.assertEqual(family, self.ui.font)
 
 
 if __name__ == '__main__':
