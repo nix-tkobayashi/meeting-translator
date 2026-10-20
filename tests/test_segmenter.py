@@ -62,6 +62,31 @@ class SentenceSegmenterTest(unittest.TestCase):
         self.assertEqual(out, ['資料を共有します。'])
         self.assertEqual(self.seg.feed('r1', words('資料 を 共有 します 。 次 に 進み ます 。'), False, ''), ['次に進みます。'])
 
+    def test_run_on_speech_flushes_at_last_comma(self):
+        clause_a = ' '.join(f'a{i}' for i in range(12)) + ' ,'
+        clause_b = ' '.join(f'b{i}' for i in range(10)) + ' ,'
+        tail = 'c0 c1'
+        out = self.seg.feed('r1', words(f'{clause_a} {clause_b} {tail}'), True, '')
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith('a0') and out[0].endswith('b9,'))
+        final = self.seg.feed('r1', words(f'{clause_a} {clause_b} {tail} .'), False, '')
+        self.assertEqual(final, ['c0 c1.'])
+
+    def test_few_words_without_sentence_end_wait(self):
+        text = ' '.join(f'w{i}' for i in range(15)) + ' , more'
+        self.assertEqual(self.seg.feed('r1', words(text), True, ''), [])
+
+    def test_hard_flush_without_punctuation(self):
+        text = ' '.join(f'w{i}' for i in range(45))
+        out = self.seg.feed('r1', words(text, 42), True, '')
+        self.assertEqual(out, [' '.join(f'w{i}' for i in range(42))])
+        self.assertEqual(self.seg.feed('r1', words(text), False, ''), ['w42 w43 w44'])
+
+    def test_japanese_comma_flush(self):
+        text = ' '.join(['語'] * 21) + ' 、 続き'
+        out = self.seg.feed('r1', words(text), True, '')
+        self.assertEqual(out, ['語' * 21 + '、'])
+
     def test_final_without_early_emit_uses_transcript(self):
         self.assertEqual(self.seg.feed('r1', [], False, ' Plain transcript '), ['Plain transcript'])
 

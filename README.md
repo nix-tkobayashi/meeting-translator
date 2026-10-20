@@ -46,8 +46,9 @@ aws cognito-idp admin-create-user --user-pool-id YOUR_USER_POOL_ID `
 
 ※ インストールせずに使う場合は`MeetingTranslator-Windows.zip`を解凍し、`config.json`を`MeetingTranslator.exe`と同じフォルダに置いて起動します。
 4. 「ブラウザでAWSログイン」を押し、各自のCognitoユーザーでログイン
-5. スピーカーとマイクを指定。音声認識は「Amazon Transcribe Streaming」を選ぶ
-6. 「双方向モード（双方のPCで実行）」を選び、両者がそれぞれ自分のPCで翻訳開始。相手の発言が自分の画面で翻訳されます。
+5. スピーカーとマイクを指定（マイクがないPCでは「（マイクを使わない）」で相手の音声だけを翻訳）。音声認識は「Amazon Transcribe Streaming」を選ぶ
+6. 「相手が話す言語」「自分が話す言語」を選ぶ（既定は相手=English、自分=日本語。「自動判定」は話者ごとに最初の発話で言語を判定）
+7. 「双方向モード（双方のPCで実行）」を選び、両者がそれぞれ自分のPCで翻訳開始。相手の発言が自分の画面で翻訳されます。
 
 ### 字幕オーバーレイ
 

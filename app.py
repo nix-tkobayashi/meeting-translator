@@ -28,6 +28,12 @@ RATE = 24000
 CHUNK_SECONDS = 5
 STREAM_FRAMES = 1600  # 100ms at 16 kHz
 SILENCE_RMS = 0.0025
+NO_MIC = '（マイクを使わない）'
+SOURCES = ('相手（PC音声）', '自分（マイク）')
+# Spoken language per source. Each stream is one person, so detect once per stream rather than per segment
+# (per-segment detection mislabeled English speech as Japanese and returned katakana).
+LANGUAGES = {'自動判定': None, 'English': 'en-US', '日本語': 'ja-JP'}
+DEFAULT_MODEL_ID = 'jp.anthropic.claude-haiku-5-5'
 # Japanese UI fonts bundled with Windows; Tk may report either the English or the Japanese family name.
 JA_FONTS = ('Yu Gothic UI', '游ゴシック UI', 'Meiryo UI', 'メイリオ UI', 'Meiryo', 'メイリオ', 'MS UI Gothic')
 AWS_ENV_LINE = re.compile(
@@ -66,6 +72,53 @@ def parse_aws_env(text):
             if value:
                 found[match.group(1).upper()] = value
     return found
+
+
+class AutoGain:
+    """Raise quiet input (e.g. a low meeting-app volume captured via loopback) to a steady level for recognition.
+    Fast attack, slow release, capped so near-silence is not blown up into noise."""
+
+    def __init__(self, target=0.1, max_gain=40.0, release=0.995):
+        self.target, self.max_gain, self.release = target, max_gain, release
+        self.level = 0.0
+
+    def apply(self, mono):
+        rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
+        self.level = max(rms, self.level * self.release)
+        gain = min(self.max_gain, self.target / self.level) if self.level > 1e-6 else 1.0
+        return np.clip(mono * gain, -1, 1)
+
+
+def transcribe_language_args(choice):
+    code = LANGUAGES.get(choice)
+    if code:
+        return {'language_code': code}
+    return {'language_code': None, 'identify_language': True, 'language_options': ['en-US', 'ja-JP']}
+
+
+def bedrock_request_fields(model_id):
+    # Haiku 5.5 thinks by default; translation needs speed, and thinking could use up maxTokens with no text.
+    if 'claude-haiku-5' in model_id:
+        return {'additionalModelRequestFields': {'thinking': {'type': 'disabled'}, 'output_config': {'effort': 'low'}}}
+    return {}
+
+
+def detect_language(text):
+    """'ja' if the text contains Japanese script, else 'en' (used when Transcribe gives no language)."""
+    return 'ja' if re.search(r'[\u3040-\u30ff\u3400-\u9fff]', text or '') else 'en'
+
+
+def transcript_language(language_code, text):
+    code = (language_code or '').lower()
+    return 'ja' if code.startswith('ja') else 'en' if code.startswith('en') else detect_language(text)
+
+
+def translation_prompt(language):
+    # The direction is fixed by the recognized language, so the model never has to guess it.
+    source, target = ('Japanese', 'English') if language == 'ja' else ('English', 'Japanese')
+    return (f'You are a real-time meeting interpreter. Translate the user\'s {source} speech transcript into natural '
+            f'{target}. Preserve names, technical terms, and numbers. The text may be a sentence fragment; translate it '
+            f'as is. Output only the {target} translation, with no notes or quotes.')
 
 
 def make_aws_session(region, credentials):
@@ -169,9 +222,16 @@ class TranslatorUI:
             entry.grid(row=row_index, column=1, sticky='ew', padx=(12, 0), pady=(6, 0))
             entry.bind('<<Paste>>', self.paste_credentials)
             self.credential_entries.append(entry)
-        tk.Label(cfg, text='利用モード', bg='#1a2435', fg='white').grid(row=8, column=0, sticky='w', pady=(9,0))
+        self.language_choice = {}
+        for column, (kind, label, default) in enumerate(zip(SOURCES, ('相手が話す言語', '自分が話す言語'), ('English', '日本語'))):
+            tk.Label(cfg, text=label, bg='#1a2435', fg='white').grid(row=8, column=column, sticky='w', pady=(9, 0),
+                                                                      padx=(12 if column else 0, 0))
+            self.language_choice[kind] = tk.StringVar(value=default)
+            ttk.Combobox(cfg, state='readonly', textvariable=self.language_choice[kind], values=list(LANGUAGES)).grid(
+                row=9, column=column, sticky='ew', pady=4, padx=(12 if column else 0, 0))
+        tk.Label(cfg, text='利用モード', bg='#1a2435', fg='white').grid(row=10, column=0, sticky='w', pady=(9,0))
         ttk.Combobox(cfg, state='readonly', textvariable=self.mode_choice,
-                     values=['個人モード', '双方向モード（双方のPCで実行）']).grid(row=9, column=0, columnspan=2, sticky='ew', pady=4)
+                     values=['個人モード', '双方向モード（双方のPCで実行）']).grid(row=11, column=0, columnspan=2, sticky='ew', pady=4)
         cfg.columnconfigure(0, weight=1)
         cfg.columnconfigure(1, weight=1)
         self.status = tk.StringVar(value='開始前 | AWS認証情報を入力するか既存のAWSプロファイルを使用')
@@ -289,18 +349,27 @@ class TranslatorUI:
         try:
             self.speakers = sc.all_speakers()
             self.mics = sc.all_microphones(include_loopback=False)
-            self.speaker_choice['values'] = [d.name for d in self.speakers]
-            self.mic_choice['values'] = [d.name for d in self.mics]
-            default_speaker = sc.default_speaker()
-            default_mic = sc.default_microphone()
-            if self.speakers:
-                ix = next((i for i, s in enumerate(self.speakers) if s.id == default_speaker.id), 0)
-                self.speaker_choice.current(ix)
-            if self.mics:
-                ix = next((i for i, m in enumerate(self.mics) if default_mic and m.id == default_mic.id), 0)
-                self.mic_choice.current(ix)
         except Exception as ex:
             self.status.set(f'音声デバイス取得失敗: {ex}')
+            return
+        self.speaker_choice['values'] = [d.name for d in self.speakers]
+        self.mic_choice['values'] = [d.name for d in self.mics] + [NO_MIC]  # the last entry means no mic
+        default_speaker, default_mic = self._default_device(sc.default_speaker), self._default_device(sc.default_microphone)
+        if self.speakers:
+            self.speaker_choice.current(next((i for i, s in enumerate(self.speakers)
+                                              if default_speaker and s.id == default_speaker.id), 0))
+        self.mic_choice.current(next((i for i, m in enumerate(self.mics)
+                                      if default_mic and m.id == default_mic.id), 0 if self.mics else len(self.mics)))
+        if not self.mics:
+            self.status.set('マイクが見つかりません。相手の音声（スピーカー）だけ翻訳します。')
+
+    @staticmethod
+    def _default_device(getter):
+        # soundcard raises when the system has no default device (e.g. a PC without any microphone).
+        try:
+            return getter()
+        except Exception:
+            return None
 
     def toggle(self):
         if self.active:
@@ -317,8 +386,8 @@ class TranslatorUI:
                 self.overlay.hide()
             self.show_main()
             return
-        if self.speaker_choice.current() < 0 or self.mic_choice.current() < 0:
-            messagebox.showerror('デバイス未選択', 'スピーカーとマイクを選択してください。')
+        if self.speaker_choice.current() < 0:
+            messagebox.showerror('デバイス未選択', 'スピーカーを選択してください。')
             return
         if self.backend.current() == 1 and not os.getenv('OPENAI_API_KEY'):
             messagebox.showerror('OpenAI APIキー', 'OPENAI_API_KEY が必要です。')
@@ -335,6 +404,8 @@ class TranslatorUI:
             if session_token and not access_key:
                 raise ValueError('セッショントークン使用時はアクセスキーIDとシークレットアクセスキーも必要です。')
             self.runtime_region = region
+            # Read Tk variables here (main thread); the capture threads only see this plain dict.
+            self.stream_languages = {kind: var.get() for kind, var in self.language_choice.items()}
             self.runtime_credentials = (access_key, secret_key, session_token or None) if access_key else self.login_credentials
             if not self.runtime_credentials and self.login_config:
                 raise ValueError('ブラウザログインを先に実行してください。')
@@ -355,8 +426,11 @@ class TranslatorUI:
         self.show_overlay()
         self.status.set(self.mode_choice.get() + ' · 音声取得中 · Bot不使用 · 相手側でもアプリを起動してください' if self.mode_choice.get().startswith('双方向') else '個人モード · 音声取得中 · Bot不使用')
         speaker = self.speakers[self.speaker_choice.current()]
-        mic = self.mics[self.mic_choice.current()]
+        mic_index = self.mic_choice.current()
+        mic = self.mics[mic_index] if 0 <= mic_index < len(self.mics) else None
         for kind, source in [('相手（PC音声）', speaker), ('自分（マイク）', mic)]:
+            if source is None:
+                continue
             if self.backend.current() == 0:
                 threading.Thread(target=self.run_aws_stream, args=(kind, source, self.stop), daemon=True).start()
             else:
@@ -391,9 +465,7 @@ class TranslatorUI:
         else:
             client = TranscribeStreamingClient(region=self.runtime_region)
         stream = await client.start_stream_transcription(
-            language_code=None,
-            identify_multiple_languages=True,
-            language_options=['ja-JP', 'en-US'],
+            **transcribe_language_args(self.stream_languages.get(kind)),
             media_sample_rate_hz=16000,
             media_encoding='pcm',
             enable_partial_results_stabilization=True,
@@ -414,10 +486,12 @@ class TranslatorUI:
                     items = [(item.content or '', item.item_type, bool(item.stable))
                              for item in (result.alternatives[0].items or [])]
                     # Stable sentences are translated during long speech without waiting for a pause.
+                    language = transcript_language(result.language_code, original)
                     for sentence in segmenter.feed(result.result_id, items, result.is_partial, original):
-                        ui.schedule_translation(kind, sentence, stop_event)
+                        ui.schedule_translation(kind, sentence, stop_event, language)
 
         async def send_audio():
+            gain = AutoGain()
             try:
                 with self.open_recording(kind, source, 16000) as recorder:
                     while not stop_event.is_set():
@@ -425,7 +499,7 @@ class TranslatorUI:
                         mono = np.asarray(samples, dtype=np.float32)
                         if mono.ndim == 2:
                             mono = mono.mean(axis=1)
-                        pcm = (np.clip(mono, -1, 1) * 32767).astype('<i2')
+                        pcm = (gain.apply(mono) * 32767).astype('<i2')
                         await stream.input_stream.send_audio_event(audio_chunk=pcm.tobytes())
             finally:
                 await stream.input_stream.end_stream()
@@ -441,7 +515,7 @@ class TranslatorUI:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
-    def schedule_translation(self, kind, original, stop_event):
+    def schedule_translation(self, kind, original, stop_event, language=None):
         # stop_event belongs to the session that produced the text, so a stopped session never sends to Bedrock.
         if stop_event.is_set() or kind in self.disabled_sources:
             return
@@ -449,7 +523,8 @@ class TranslatorUI:
             pool = self.translation_pools.get(kind)
             if pool is None:
                 pool = self.translation_pools[kind] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            pool.submit(self.translate_with_bedrock, kind, original, stop_event, self.bedrock)
+            pool.submit(self.translate_with_bedrock, kind, original, stop_event, self.bedrock,
+                        language or detect_language(original))
 
     def cancel_translations(self):
         # Drop queued requests; requests already sent to Bedrock finish but are not displayed.
@@ -458,31 +533,24 @@ class TranslatorUI:
         for pool in pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
 
-    def translate_with_bedrock(self, kind, original, stop_event, bedrock):
+    def translate_with_bedrock(self, kind, original, stop_event, bedrock, language):
         if stop_event.is_set() or kind in self.disabled_sources:  # stopped, or muted while queued
             return
         try:
-            model_id = os.getenv('BEDROCK_MODEL_ID', 'jp.anthropic.claude-haiku-5-5')
-            system_prompt = (
-                'You are a real-time bilingual meeting interpreter. Detect if the text is primarily Japanese or English. '
-                'Translate Japanese to English and English to Japanese faithfully. Preserve names, technical terms, and numbers. '
-                'Do not explain or add notes. Reply with exactly two lines: first line ja or en (source language), '
-                'second line the translated text. Do not add any other text.'
-            )
+            model_id = os.getenv('BEDROCK_MODEL_ID', DEFAULT_MODEL_ID)
             result = bedrock.converse(
                 modelId=model_id,
-                system=[{'text': system_prompt}],
+                system=[{'text': translation_prompt(language)}],
                 messages=[{'role': 'user', 'content': [{'text': original}]}],
                 inferenceConfig={'maxTokens': 512},
+                **bedrock_request_fields(model_id),
             )
             blocks = result.get('output', {}).get('message', {}).get('content', [])
-            text = ''.join(b.get('text', '') for b in blocks).strip()
-            first, sep, translation = text.partition('\n')
-            language = first.strip().lower()
-            if language not in ('ja', 'en') or not sep:
-                raise ValueError('Bedrock翻訳の応答形式が不正: ' + text[:160])
+            translation = ''.join(b.get('text', '') for b in blocks).strip()
+            if not translation:
+                raise ValueError(f'Bedrockから訳文が返りませんでした（stopReason: {result.get("stopReason")}）')
             if not stop_event.is_set():
-                self.events.put(('caption', kind, original, translation.strip(), language))
+                self.events.put(('caption', kind, original, translation, language))
         except Exception as ex:
             if not stop_event.is_set():
                 self.events.put(('error', kind, 'Bedrock翻訳: ' + str(ex)))

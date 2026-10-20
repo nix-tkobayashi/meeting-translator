@@ -83,15 +83,15 @@ class TranslationStopTest(unittest.TestCase):
         self.ui = make_ui()
         stop = threading.Event()
         stop.set()
-        self.ui.translate_with_bedrock('相手', 'hello', stop, self.ui.bedrock)
+        self.ui.translate_with_bedrock('相手', 'hello', stop, self.ui.bedrock, 'en')
         self.ui.bedrock.converse.assert_not_called()
         self.assertTrue(self.ui.events.empty())
 
     def test_translate_uses_bound_client(self):
         self.ui = make_ui()
         bound = mock.Mock()
-        bound.converse.return_value = bedrock_reply('en\nこんにちは')
-        self.ui.translate_with_bedrock('相手', 'hello', threading.Event(), bound)
+        bound.converse.return_value = bedrock_reply('こんにちは')
+        self.ui.translate_with_bedrock('相手', 'hello', threading.Event(), bound, 'en')
         bound.converse.assert_called_once()
         self.ui.bedrock.converse.assert_not_called()
         self.assertEqual(self.ui.events.get_nowait(), ('caption', '相手', 'hello', 'こんにちは', 'en'))
@@ -99,7 +99,7 @@ class TranslationStopTest(unittest.TestCase):
     def test_scheduled_task_keeps_its_session_client(self):
         self.ui = make_ui()
         old_client = self.ui.bedrock
-        old_client.converse.return_value = bedrock_reply('en\nこんにちは')
+        old_client.converse.return_value = bedrock_reply('こんにちは')
         gate = threading.Event()
         self.ui.translation_pools['相手'].submit(gate.wait)
         self.ui.schedule_translation('相手', 'hello', threading.Event())
@@ -124,7 +124,7 @@ class TranslationStopTest(unittest.TestCase):
 
     def test_schedule_after_cancel_starts_fresh_pool(self):
         self.ui = make_ui()
-        self.ui.bedrock.converse.return_value = bedrock_reply('en\nこんにちは')
+        self.ui.bedrock.converse.return_value = bedrock_reply('こんにちは')
         self.ui.cancel_translations()
         self.ui.schedule_translation('相手', 'hello', threading.Event())
         self.ui.translation_pools['相手'].shutdown(wait=True)
@@ -155,7 +155,7 @@ class TranslationStopTest(unittest.TestCase):
         def converse(messages, **_):
             text = messages[0]['content'][0]['text']
             time.sleep(delays.get(text, 0))
-            return bedrock_reply('en\n' + text.upper())
+            return bedrock_reply(text.upper())
 
         self.ui.bedrock.converse.side_effect = converse
         stop = threading.Event()
@@ -178,8 +178,86 @@ class TranslationStopTest(unittest.TestCase):
             raise RuntimeError('boom')
 
         client.converse.side_effect = stop_then_fail
-        self.ui.translate_with_bedrock('相手', 'hello', stop, client)
+        self.ui.translate_with_bedrock('相手', 'hello', stop, client, 'en')
         self.assertTrue(self.ui.events.empty())
+
+
+class TranslationRequestTest(unittest.TestCase):
+    def test_detect_language(self):
+        self.assertEqual(app.detect_language('来月までにまとめます'), 'ja')
+        self.assertEqual(app.detect_language('カタカナ'), 'ja')
+        self.assertEqual(app.detect_language('Budget is 6 weeks.'), 'en')
+
+    def test_transcript_language_prefers_transcribe_code(self):
+        self.assertEqual(app.transcript_language('en-US', 'カタカナ'), 'en')
+        self.assertEqual(app.transcript_language('ja-JP', 'AWS'), 'ja')
+        self.assertEqual(app.transcript_language(None, '日本語'), 'ja')
+
+    def test_prompt_fixes_direction(self):
+        self.assertIn('English speech transcript into natural Japanese', app.translation_prompt('en'))
+        self.assertIn('Japanese speech transcript into natural English', app.translation_prompt('ja'))
+
+    def test_request_disables_thinking_for_haiku_5(self):
+        ui = make_ui()
+        ui.bedrock.converse.return_value = bedrock_reply('現在の作業負荷が高すぎるためです。')
+        ui.translate_with_bedrock('相手', 'Because the workload is too high.', threading.Event(), ui.bedrock, 'en')
+        kwargs = ui.bedrock.converse.call_args.kwargs
+        self.assertEqual(kwargs['modelId'], app.DEFAULT_MODEL_ID)
+        self.assertEqual(kwargs['additionalModelRequestFields'],
+                         {'thinking': {'type': 'disabled'}, 'output_config': {'effort': 'low'}})
+        self.assertIn('into natural Japanese', kwargs['system'][0]['text'])
+        self.assertEqual(ui.events.get_nowait()[3:], ('現在の作業負荷が高すぎるためです。', 'en'))
+
+    def test_other_models_get_no_extra_fields(self):
+        self.assertEqual(app.bedrock_request_fields('jp.anthropic.claude-haiku-4-5-20251001-v1:0'), {})
+
+    def test_reasoning_only_response_is_an_error(self):
+        ui = make_ui()
+        ui.bedrock.converse.return_value = {'stopReason': 'max_tokens', 'output': {'message': {'content': [
+            {'reasoningContent': {'reasoningText': {'text': ''}}}]}}}
+        ui.translate_with_bedrock('相手', 'hello', threading.Event(), ui.bedrock, 'en')
+        event = ui.events.get_nowait()
+        self.assertEqual(event[0], 'error')
+        self.assertIn('max_tokens', event[2])
+
+    def test_schedule_detects_language_when_unknown(self):
+        ui = make_ui()
+        with mock.patch.object(ui, 'translate_with_bedrock') as translate:
+            ui.schedule_translation('相手', '資料を共有します', threading.Event())
+            ui.translation_pools['相手'].shutdown(wait=True)
+        self.assertEqual(translate.call_args.args[-1], 'ja')
+
+
+class TranscribeSettingsTest(unittest.TestCase):
+    def test_fixed_language(self):
+        self.assertEqual(app.transcribe_language_args('English'), {'language_code': 'en-US'})
+        self.assertEqual(app.transcribe_language_args('日本語'), {'language_code': 'ja-JP'})
+
+    def test_auto_detects_once_per_stream(self):
+        args = app.transcribe_language_args('自動判定')
+        self.assertTrue(args['identify_language'])
+        self.assertIsNone(args['language_code'])
+        self.assertNotIn('identify_multiple_languages', args)
+
+
+class AutoGainTest(unittest.TestCase):
+    def rms(self, x):
+        return float(app.np.sqrt(app.np.mean(app.np.square(x))))
+
+    def test_quiet_input_is_raised(self):
+        gain = app.AutoGain()
+        quiet = 0.002 * app.np.sin(app.np.linspace(0, 200, 1600)).astype('float32')
+        self.assertGreater(self.rms(gain.apply(quiet)), 0.05)
+
+    def test_gain_is_capped_and_clipped(self):
+        gain = app.AutoGain(max_gain=40.0)
+        tiny = app.np.full(1600, 1e-4, dtype='float32')
+        self.assertAlmostEqual(float(gain.apply(tiny)[0]), 4e-3, places=5)
+        loud = app.np.full(1600, 0.9, dtype='float32')
+        self.assertLessEqual(float(gain.apply(loud).max()), 1.0)
+
+    def test_silence_stays_silent(self):
+        self.assertEqual(float(app.AutoGain().apply(app.np.zeros(1600, dtype='float32')).max()), 0.0)
 
 
 class ParseAwsEnvTest(unittest.TestCase):
