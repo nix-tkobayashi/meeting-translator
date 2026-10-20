@@ -13,6 +13,7 @@ from datetime import datetime
 from auth import load_public_config, browser_login
 import updater
 from segmenter import SentenceSegmenter
+from overlay import CaptionOverlay
 from version import __version__
 from pathlib import Path
 
@@ -104,6 +105,8 @@ class TranslatorUI:
         self.root.after(100, self.process_events)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.pending_update = None
+        self.disabled_sources = set()  # sources muted from the overlay pill
+        self.overlay = None
         threading.Thread(target=self.check_update, daemon=True).start()
 
     def make_ui(self):
@@ -212,6 +215,28 @@ class TranslatorUI:
             self.cfg.pack_forget()
         self.settings_button.config(text='▲ 設定を隠す' if visible else '▼ 設定を表示')
 
+    def show_overlay(self):
+        if self.overlay is None:
+            self.overlay = CaptionOverlay(self.root, self.font, on_stop=self.stop_from_overlay,
+                                          on_settings=self.show_main, on_source_toggle=self.set_source_enabled)
+        self.disabled_sources.clear()
+        self.overlay.reset()
+        self.overlay.show()
+        self.root.iconify()  # the floating captions replace the main window while translating
+
+    def stop_from_overlay(self):
+        if self.active:
+            self.toggle()
+
+    def show_main(self):
+        self.root.deiconify()
+        self.root.lift()
+
+    def set_source_enabled(self, kind, enabled):
+        (self.disabled_sources.discard if enabled else self.disabled_sources.add)(kind)
+        if not enabled and self.overlay:
+            self.overlay.set_partial(kind, '')
+
     def toggle_settings(self):
         self.set_settings_visible(not self.cfg.winfo_manager())
 
@@ -288,6 +313,9 @@ class TranslatorUI:
             for widget in self.credential_entries:
                 widget.config(state='normal')
             self.set_settings_visible(True)
+            if self.overlay:
+                self.overlay.hide()
+            self.show_main()
             return
         if self.speaker_choice.current() < 0 or self.mic_choice.current() < 0:
             messagebox.showerror('デバイス未選択', 'スピーカーとマイクを選択してください。')
@@ -324,6 +352,7 @@ class TranslatorUI:
             widget.config(state='disabled')
         self.start_button.config(text='■  停止', bg='#b24c62')
         self.set_settings_visible(False)  # give the captions the space while translating
+        self.show_overlay()
         self.status.set(self.mode_choice.get() + ' · 音声取得中 · Bot不使用 · 相手側でもアプリを起動してください' if self.mode_choice.get().startswith('双方向') else '個人モード · 音声取得中 · Bot不使用')
         speaker = self.speakers[self.speaker_choice.current()]
         mic = self.mics[self.mic_choice.current()]
@@ -414,7 +443,7 @@ class TranslatorUI:
 
     def schedule_translation(self, kind, original, stop_event):
         # stop_event belongs to the session that produced the text, so a stopped session never sends to Bedrock.
-        if stop_event.is_set():
+        if stop_event.is_set() or kind in self.disabled_sources:
             return
         with self.pools_lock:  # called from capture threads while stop/close may swap the pools
             pool = self.translation_pools.get(kind)
@@ -430,7 +459,7 @@ class TranslatorUI:
             pool.shutdown(wait=False, cancel_futures=True)
 
     def translate_with_bedrock(self, kind, original, stop_event, bedrock):
-        if stop_event.is_set():
+        if stop_event.is_set() or kind in self.disabled_sources:  # stopped, or muted while queued
             return
         try:
             model_id = os.getenv('BEDROCK_MODEL_ID', 'jp.anthropic.claude-haiku-5-5')
@@ -518,10 +547,14 @@ class TranslatorUI:
                 if event[0] == 'caption':
                     _, source, original, translation, language = event
                     self.add_line(source, original, translation, language)
+                    if self.overlay and source not in self.disabled_sources:
+                        self.overlay.add_caption(source, original, translation)
                     self.history.append({'time': datetime.now().isoformat(timespec='seconds'), 'source': source, 'language': language, 'original': original, 'translation': translation})
                 elif event[0] == 'partial':
                     _, source, fragment = event
                     self.partial.set(f'認識中 [{source}]: {fragment}' if fragment else '')
+                    if self.overlay and source not in self.disabled_sources:
+                        self.overlay.set_partial(source, fragment)
                 elif event[0] == 'login_success':
                     self.login_credentials = event[1]
                     self.status.set('ブラウザ認証成功：一時AWS認証情報を取得しました。翻訳開始できます。')
@@ -549,6 +582,8 @@ class TranslatorUI:
                 elif event[0] == 'error':
                     _, source, error = event
                     self.add_line('エラー: ' + source, error, '', 'error')
+                    if self.overlay:
+                        self.overlay.set_status('⚠ ' + error)
                     self.status.set('録音/通信エラー。内容を確認してください。')
         except queue.Empty:
             pass

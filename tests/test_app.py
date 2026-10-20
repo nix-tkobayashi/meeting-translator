@@ -39,6 +39,7 @@ def make_ui():
     ui.events = queue.Queue()
     ui.translation_pools = {'相手': app.concurrent.futures.ThreadPoolExecutor(max_workers=1)}
     ui.pools_lock = threading.Lock()
+    ui.disabled_sources = set()
     ui.bedrock = mock.Mock()
     return ui
 
@@ -128,6 +129,23 @@ class TranslationStopTest(unittest.TestCase):
         self.ui.schedule_translation('相手', 'hello', threading.Event())
         self.ui.translation_pools['相手'].shutdown(wait=True)
         self.ui.bedrock.converse.assert_called_once()
+
+    def test_muted_source_is_not_translated(self):
+        self.ui = make_ui()
+        self.ui.disabled_sources.add('相手')
+        self.ui.schedule_translation('相手', 'hello', threading.Event())
+        self.ui.translation_pools['相手'].shutdown(wait=True)
+        self.ui.bedrock.converse.assert_not_called()
+
+    def test_queued_translation_dropped_when_muted(self):
+        self.ui = make_ui()
+        gate = threading.Event()
+        self.ui.translation_pools['相手'].submit(gate.wait)
+        self.ui.schedule_translation('相手', 'hello', threading.Event())
+        self.ui.disabled_sources.add('相手')
+        gate.set()
+        self.ui.translation_pools['相手'].shutdown(wait=True)
+        self.ui.bedrock.converse.assert_not_called()
 
     def test_captions_keep_order_per_speaker(self):
         self.ui = make_ui()
@@ -247,6 +265,23 @@ class UiTest(unittest.TestCase):
         entry.event_generate('<<Paste>>')
         self.assertEqual(self.ui.access_key.get(), 'AKIAONLY')
         self.assertEqual(self.ui.secret_key.get(), '')
+
+    def test_start_shows_overlay_and_stop_restores_main(self):
+        self.ui.show_overlay()
+        self.root.update()
+        self.assertEqual(self.ui.overlay.panel.state(), 'normal')
+        self.assertEqual(self.root.state(), 'iconic')
+        self.ui.overlay.hide()
+        self.ui.show_main()
+        self.root.update()
+        self.assertEqual(self.root.state(), 'normal')
+        self.assertEqual(self.ui.overlay.panel.state(), 'withdrawn')
+
+    def test_caption_event_reaches_overlay(self):
+        self.ui.show_overlay()
+        self.ui.events.put(('caption', '相手（PC音声）', 'Hello.', 'こんにちは。', 'en'))
+        self.ui.process_events()
+        self.assertEqual(self.ui.overlay.captions, [('相手（PC音声）', 'Hello.', 'こんにちは。')])
 
     def test_japanese_font_applied(self):
         if self.ui.font == 'TkDefaultFont':
